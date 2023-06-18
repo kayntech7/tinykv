@@ -3,6 +3,7 @@ package test_raftstore
 import (
 	"bytes"
 	"fmt"
+	"github.com/pkg/errors"
 	"math/rand"
 	_ "net/http/pprof"
 	"strconv"
@@ -29,7 +30,7 @@ func runClient(t *testing.T, me int, ca chan bool, fn func(me int, t *testing.T)
 }
 
 // spawn ncli clients and wait until they are all done
-func SpawnClientsAndWait(t *testing.T, ch chan bool, ncli int, fn func(me int, t *testing.T)) {
+func SpawnClientsAndWait(t *testing.T, ch chan bool, ncli int, fn func(me int, t *testing.T)) error {
 	defer func() { ch <- true }()
 	ca := make([]chan bool, ncli)
 	for cli := 0; cli < ncli; cli++ {
@@ -41,10 +42,12 @@ func SpawnClientsAndWait(t *testing.T, ch chan bool, ncli int, fn func(me int, t
 		ok := <-ca[cli]
 		// log.Infof("SpawnClientsAndWait: client %d is done\n", cli)
 		if ok == false {
-			t.Fatalf("failure")
+			t.Logf("failure, stopping")
+			return errors.New("SpawnClientsAndWait start error")
 		}
 	}
 
+	return nil
 }
 
 // predict effect of Append(k, val) if old value is prev.
@@ -197,32 +200,45 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 		// log.Printf("Iteration %v\n", i)
 		atomic.StoreInt32(&done_clients, 0)
 		atomic.StoreInt32(&done_partitioner, 0)
-		go SpawnClientsAndWait(t, ch_clients, nclients, func(cli int, t *testing.T) {
-			j := 0
-			defer func() {
-				clnts[cli] <- j
-			}()
-			last := ""
-			for atomic.LoadInt32(&done_clients) == 0 {
-				if (rand.Int() % 1000) < 500 {
-					key := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", j)
-					value := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
-					// log.Infof("%d: client new put %v,%v\n", cli, key, value)
-					cluster.MustPut([]byte(key), []byte(value))
-					last = NextValue(last, value)
-					j++
-				} else {
-					start := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", 0)
-					end := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", j)
-					// log.Infof("%d: client new scan %v-%v\n", cli, start, end)
-					values := cluster.Scan([]byte(start), []byte(end))
-					v := string(bytes.Join(values, []byte("")))
-					if v != last {
-						log.Fatalf("get wrong value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
+
+		// TODO: A temporary solution, may be updated in the near future
+		errs := make(chan error, 1)
+		go func() {
+			err := SpawnClientsAndWait(t, ch_clients, nclients, func(cli int, t *testing.T) {
+				j := 0
+				defer func() {
+					clnts[cli] <- j
+				}()
+				last := ""
+				for atomic.LoadInt32(&done_clients) == 0 {
+					if (rand.Int() % 1000) < 500 {
+						key := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", j)
+						value := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
+						// log.Infof("%d: client new put %v,%v\n", cli, key, value)
+						cluster.MustPut([]byte(key), []byte(value))
+						last = NextValue(last, value)
+						j++
+					} else {
+						start := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", 0)
+						end := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", j)
+						// log.Infof("%d: client new scan %v-%v\n", cli, start, end)
+						values := cluster.Scan([]byte(start), []byte(end))
+						v := string(bytes.Join(values, []byte("")))
+						if v != last {
+							log.Fatalf("get wrong value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
+						}
 					}
 				}
-			}
-		})
+			})
+
+			errs <- err
+		}()
+
+		// wait for it
+		err := <-errs
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		if unreliable || partitions {
 			// Allow the clients to perform some operations without interruption
